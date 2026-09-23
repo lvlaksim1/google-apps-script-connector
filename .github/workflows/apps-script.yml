@@ -1,6 +1,14 @@
 name: Apps Script Connector
 
 on:
+  workflow_call:
+    inputs:
+      project:
+        required: true
+        type: string
+      operation:
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       project:
