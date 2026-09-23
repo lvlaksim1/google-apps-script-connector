@@ -1,0 +1,12 @@
+# Google OAuth credentials must never be committed.
+.clasprc.json
+**/.clasprc.json
+client_secret*.json
+credentials*.json
+
+# Temporary deployment output
+**/.deploy-output.json
+
+# Local tooling
+node_modules/
+.DS_Store
