@@ -1,0 +1,30 @@
+name: Validate Connector
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Validate project registry
+        run: node scripts/validate-projects.mjs
+
+      - name: Reject committed Google credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          if find . -type f \(               -name '.clasprc.json' -o               -name 'client_secret*.json' -o               -name 'credentials*.json'             \) -not -path './.git/*' | grep -q .; then
+            echo "::error::Google credential file committed to repository."
+            exit 1
+          fi
