@@ -59,6 +59,23 @@ projects/<project-name>/
 - `operation=deploy` — обновить уже созданный проект и deployment;
 - `operation=verify` — проверить публичный Web App без Google OAuth.
 
+## Issue-команда
+
+Для автоматического запуска без UI создать Issue с точным заголовком:
+
+`[GAS_RUN]`
+
+и JSON-телом:
+
+```json
+{
+  "project": "relay-probe",
+  "operation": "bootstrap_deploy"
+}
+```
+
+Команда принимается только от `lvlaksim1`. После выполнения workflow пишет результат в Issue и закрывает его.
+
 ## OAuth
 
 Нужен **отдельный** OAuth для этого connector-репозитория. Он не должен зависеть от секретов production-репозиториев.
