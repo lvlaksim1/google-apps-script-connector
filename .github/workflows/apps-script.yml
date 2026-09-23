@@ -1,0 +1,248 @@
+name: Apps Script Connector
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: Project directory under projects/
+        required: true
+        default: relay-probe
+        type: string
+      operation:
+        description: Connector operation
+        required: true
+        default: bootstrap_deploy
+        type: choice
+        options:
+          - bootstrap_deploy
+          - deploy
+          - verify
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apps-script-${{ inputs.project }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Resolve project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT='${{ inputs.project }}'
+          if [[ ! "$PROJECT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$ ]]; then
+            echo "Invalid project name: $PROJECT"
+            exit 2
+          fi
+
+          DIR="projects/$PROJECT"
+          test -f "$DIR/project.json"
+          test -f "$DIR/src/appsscript.json"
+
+          TITLE="$(node -e "const j=require('./$DIR/project.json'); process.stdout.write(String(j.title||''))")"
+          MARKER="$(node -e "const j=require('./$DIR/project.json'); process.stdout.write(String(j.expectedMarker||''))")"
+
+          if [ -z "$TITLE" ]; then
+            echo "project.json must contain title"
+            exit 3
+          fi
+
+          echo "name=$PROJECT" >> "$GITHUB_OUTPUT"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+          echo "marker=$MARKER" >> "$GITHUB_OUTPUT"
+
+      - name: Verify existing public deployment
+        if: inputs.operation == 'verify'
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.dir }}
+          EXPECTED_MARKER: ${{ steps.project.outputs.marker }}
+        run: |
+          set -euo pipefail
+          test -s "$PROJECT_DIR/.web-app-url"
+          URL="$(tr -d '\r\n' < "$PROJECT_DIR/.web-app-url")"
+          PROBE="verify-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          RESPONSE="$(curl --location --fail --silent --show-error "$URL?probe=$PROBE")"
+          printf '%s\n' "$RESPONSE"
+
+          if [ -n "$EXPECTED_MARKER" ]; then
+            grep -Fq "$EXPECTED_MARKER" <<<"$RESPONSE"
+          fi
+          grep -Fq "probe=$PROBE" <<<"$RESPONSE"
+
+      - name: Check OAuth configuration
+        if: inputs.operation != 'verify'
+        shell: bash
+        env:
+          CLASPRC_B64: ${{ secrets.CLASPRC_B64 }}
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CLASPRC_B64" ] && [ -z "$CLASPRC_JSON" ]; then
+            echo "::error::Set CLASPRC_JSON or CLASPRC_B64 in this repository."
+            exit 10
+          fi
+
+      - name: Install clasp
+        if: inputs.operation != 'verify'
+        run: npm install --global @google/clasp@3.4.1
+
+      - name: Restore connector OAuth
+        if: inputs.operation != 'verify'
+        shell: bash
+        env:
+          CLASPRC_B64: ${{ secrets.CLASPRC_B64 }}
+          CLASPRC_JSON: ${{ secrets.CLASPRC_JSON }}
+        run: |
+          set -euo pipefail
+          if [ -n "$CLASPRC_B64" ]; then
+            printf '%s' "$CLASPRC_B64" | base64 --decode > "$HOME/.clasprc.json"
+          else
+            printf '%s' "$CLASPRC_JSON" > "$HOME/.clasprc.json"
+          fi
+          node -e "JSON.parse(require('fs').readFileSync(process.env.HOME + '/.clasprc.json','utf8'))"
+          chmod 600 "$HOME/.clasprc.json"
+          clasp show-authorized-user --json
+
+      - name: Create a new Apps Script project when needed
+        if: inputs.operation == 'bootstrap_deploy'
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.dir }}
+          PROJECT_TITLE: ${{ steps.project.outputs.title }}
+        run: |
+          set -euo pipefail
+
+          if [ -s "$PROJECT_DIR/.clasp.json" ]; then
+            echo "Existing Script ID found; bootstrap is idempotent."
+            exit 0
+          fi
+
+          TMP="$(mktemp -d)"
+          (
+            cd "$TMP"
+            clasp create-script --title "$PROJECT_TITLE" --type webapp --rootDir src --json
+          )
+
+          test -s "$TMP/.clasp.json"
+          cp "$TMP/.clasp.json" "$PROJECT_DIR/.clasp.json"
+
+          echo "Created a completely new Apps Script project."
+          cat "$PROJECT_DIR/.clasp.json"
+
+      - name: Require existing Apps Script project
+        if: inputs.operation == 'deploy'
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.dir }}
+        run: |
+          set -euo pipefail
+          if [ ! -s "$PROJECT_DIR/.clasp.json" ]; then
+            echo "::error::No Script ID. Run bootstrap_deploy first."
+            exit 20
+          fi
+
+      - name: Push source
+        if: inputs.operation != 'verify'
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.dir }}
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          clasp push --force
+
+      - name: Create or update deployment
+        if: inputs.operation != 'verify'
+        id: deploy
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.dir }}
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+
+          DESCRIPTION="github-${GITHUB_SHA:0:12}-run-${GITHUB_RUN_ID}"
+
+          if [ -s .gas-deployment-id ]; then
+            DEPLOYMENT_ID="$(tr -d '\r\n' < .gas-deployment-id)"
+            clasp create-deployment               --deploymentId "$DEPLOYMENT_ID"               --description "$DESCRIPTION"               --json | tee .deploy-output.json
+          else
+            clasp create-deployment               --description "$DESCRIPTION"               --json | tee .deploy-output.json
+
+            DEPLOYMENT_ID="$(node ../../scripts/parse-deployment.mjs .deploy-output.json)"
+            printf '%s\n' "$DEPLOYMENT_ID" > .gas-deployment-id
+          fi
+
+          URL="https://script.google.com/macros/s/$DEPLOYMENT_ID/exec"
+          printf '%s\n' "$URL" > .web-app-url
+
+          echo "deployment_id=$DEPLOYMENT_ID" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Verify deployed Web App
+        if: inputs.operation != 'verify'
+        shell: bash
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+          EXPECTED_MARKER: ${{ steps.project.outputs.marker }}
+        run: |
+          set -euo pipefail
+
+          PROBE="deploy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          OK=false
+
+          for attempt in 1 2 3 4 5 6; do
+            echo "HTTP probe attempt $attempt"
+            if RESPONSE="$(curl --location --fail --silent --show-error "$URL?probe=$PROBE")"; then
+              printf '%s\n' "$RESPONSE"
+              if { [ -z "$EXPECTED_MARKER" ] || grep -Fq "$EXPECTED_MARKER" <<<"$RESPONSE"; }                 && grep -Fq "probe=$PROBE" <<<"$RESPONSE"; then
+                OK=true
+                break
+              fi
+            fi
+            sleep 5
+          done
+
+          if [ "$OK" != "true" ]; then
+            echo "::error::Web App did not return the expected public response."
+            exit 30
+          fi
+
+      - name: Persist non-secret project identifiers
+        if: inputs.operation != 'verify'
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.dir }}
+        run: |
+          set -euo pipefail
+
+          rm -f "$PROJECT_DIR/.deploy-output.json"
+
+          git config user.name "google-apps-script-connector"
+          git config user.email "actions@users.noreply.github.com"
+
+          git add             "$PROJECT_DIR/.clasp.json"             "$PROJECT_DIR/.gas-deployment-id"             "$PROJECT_DIR/.web-app-url"
+
+          if git diff --cached --quiet; then
+            echo "No connector state changes to commit."
+          else
+            git commit -m "Record Apps Script state for ${{ steps.project.outputs.name }}"
+            git push
+          fi
