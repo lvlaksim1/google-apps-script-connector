@@ -1,0 +1,73 @@
+name: Apps Script Issue Command
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  parse:
+    if: github.event.issue.title == '[GAS_RUN]' && github.actor == 'lvlaksim1'
+    runs-on: ubuntu-latest
+    outputs:
+      project: ${{ steps.parse.outputs.project }}
+      operation: ${{ steps.parse.outputs.operation }}
+    steps:
+      - name: Parse command
+        id: parse
+        shell: bash
+        env:
+          BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+
+          PROJECT="$(jq -r '.project // empty' <<<"$BODY")"
+          OPERATION="$(jq -r '.operation // empty' <<<"$BODY")"
+
+          if [[ ! "$PROJECT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$ ]]; then
+            echo "::error::Invalid project"
+            exit 2
+          fi
+
+          case "$OPERATION" in
+            bootstrap_deploy|deploy|verify) ;;
+            *)
+              echo "::error::Invalid operation"
+              exit 3
+              ;;
+          esac
+
+          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
+          echo "operation=$OPERATION" >> "$GITHUB_OUTPUT"
+
+  run_connector:
+    needs: parse
+    uses: ./.github/workflows/apps-script.yml
+    with:
+      project: ${{ needs.parse.outputs.project }}
+      operation: ${{ needs.parse.outputs.operation }}
+    secrets: inherit
+
+  finish:
+    if: always() && needs.parse.result == 'success'
+    needs:
+      - parse
+      - run_connector
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      RESULT: ${{ needs.run_connector.result }}
+      PROJECT: ${{ needs.parse.outputs.project }}
+      OPERATION: ${{ needs.parse.outputs.operation }}
+    steps:
+      - name: Report command result
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUN_URL="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          gh issue comment "$ISSUE_NUMBER"             --repo "$GITHUB_REPOSITORY"             --body "Apps Script command completed. Project: `$PROJECT`. Operation: `$OPERATION`. Result: **$RESULT**. Run: $RUN_URL"
+          gh issue close "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY"
