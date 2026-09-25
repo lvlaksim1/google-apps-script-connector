@@ -1,0 +1,68 @@
+name: Relay Mailbox Read
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  read:
+    if: github.event.issue.title == '[RELAY_MAILBOX_READ]' && github.actor == 'lvlaksim1'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Parse nonce
+        id: parse
+        shell: bash
+        env:
+          BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          NONCE="$(jq -r '.nonce // empty' <<<"$BODY")"
+          if [[ ! "$NONCE" =~ ^[A-Za-z0-9._-]{1,120}$ ]]; then
+            echo "::error::Invalid nonce"
+            exit 2
+          fi
+          echo "nonce=$NONCE" >> "$GITHUB_OUTPUT"
+
+      - name: Read mailbox
+        id: read
+        shell: bash
+        env:
+          NONCE: ${{ steps.parse.outputs.nonce }}
+        run: |
+          set -euo pipefail
+          URL="$(tr -d '\r\n' < projects/relay-probe/.web-app-url)"
+          RESPONSE="$(curl --location --fail --silent --show-error "$URL?mode=read&nonce=$NONCE")"
+          mkdir -p probes/mailbox
+          printf '%s' "$RESPONSE" > "probes/mailbox/$NONCE.txt"
+          echo "response=$RESPONSE" >> "$GITHUB_OUTPUT"
+
+      - name: Persist mailbox result
+        shell: bash
+        env:
+          NONCE: ${{ steps.parse.outputs.nonce }}
+        run: |
+          set -euo pipefail
+          git config user.name "relay-mailbox-reader"
+          git config user.email "actions@users.noreply.github.com"
+          git add "probes/mailbox/$NONCE.txt"
+          git commit -m "Read relay mailbox $NONCE"
+          git push
+
+      - name: Report
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          NONCE: ${{ steps.parse.outputs.nonce }}
+        run: |
+          set -euo pipefail
+          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body "Relay mailbox read completed for `$NONCE`. Run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          gh issue close "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY"
